@@ -20,7 +20,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Generate image tag (short SHA)
+      - name: Generate image tag (short SHA + latest)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -87,11 +87,12 @@ jobs:
       - name: Publish Kafka deployment event
         if: success()
         run: |
-          docker run --rm confluentinc/cp-kafka:7.5.0 \
+          EVENT="{\"event\":\"WebsiteDeployed\",\"user\":\"user1\",\"image\":\"${{ needs.build.outputs.image_tag }}\",\"status\":\"success\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+          echo "$EVENT" | docker run --rm -i confluentinc/cp-kafka:7.5.0 \
             kafka-console-producer \
             --bootstrap-server ${{ secrets.KAFKA_BROKER }} \
-            --topic deployment-events <<< \
-            "{\"event\":\"WebsiteDeployed\",\"user\":\"user1\",\"image\":\"${{ needs.build.outputs.image_tag }}\",\"status\":\"success\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+            --topic deployment-events
+          echo "✅ Kafka event published: $EVENT"
 
       - name: Print deployment summary
         if: always()
@@ -104,3 +105,4 @@ jobs:
           echo "  Registry:  ${{ secrets.ACR_LOGIN_SERVER }}"
           echo "==============================="
           kubectl get pods -n user1
+
