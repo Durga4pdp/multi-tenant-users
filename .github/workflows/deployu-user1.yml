@@ -1,4 +1,4 @@
-name: Deploy user1
+name: Deploy-user1
 
 on:
   push:
