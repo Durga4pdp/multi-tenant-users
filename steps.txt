@@ -1,0 +1,724 @@
+====================================================
+  DEVOPS SETUP GUIDE — MULTI-TENANT HOSTING PLATFORM
+  VM Public IP: 74.225.253.132 | Ubuntu 24.04
+====================================================
+
+DNS STRATEGY: nip.io (No Domain Purchase Needed)
+-------------------------------------------------
+nip.io is a free wildcard DNS service. Any subdomain ending in
+<something>.74.225.253.132.nip.io automatically resolves to 74.225.253.132.
+
+Your user URLs:
+  user1.74.225.253.132.nip.io  → 74.225.253.132
+  user2.74.225.253.132.nip.io  → 74.225.253.132
+  user3.74.225.253.132.nip.io  → 74.225.253.132
+
+No DNS config, no domain purchase, works immediately.
+
+====================================================
+PHASE 1 — VM PREPARATION
+====================================================
+
+Step 1.1: SSH into your VM
+--------------------------
+  ssh ubuntu@74.225.253.132
+
+Step 1.2: Update system packages
+---------------------------------
+  sudo apt update && sudo apt upgrade -y
+  sudo apt install -y curl wget git vim unzip apt-transport-https \
+    ca-certificates gnupg lsb-release software-properties-common
+
+Step 1.3: Install Docker
+-------------------------
+  curl -fsSL https://get.docker.com | sudo bash
+  sudo usermod -aG docker $USER
+  newgrp docker
+  docker --version   # Verify: Docker version 25.x.x
+
+Step 1.4: Open required firewall ports
+----------------------------------------
+  sudo ufw allow 22/tcp      # SSH
+  sudo ufw allow 80/tcp      # HTTP
+  sudo ufw allow 443/tcp     # HTTPS
+  sudo ufw allow 6443/tcp    # K3s API
+  sudo ufw allow 9092/tcp    # Kafka
+  sudo ufw enable
+  sudo ufw status
+
+
+====================================================
+PHASE 2 — KUBERNETES (K3s) INSTALLATION
+====================================================
+
+Step 2.1: Install K3s (lightweight Kubernetes)
+------------------------------------------------
+  curl -sfL https://get.k3s.io | sh -s - \
+    --write-kubeconfig-mode 644 \
+    --disable traefik \
+    --node-external-ip 74.225.253.132
+
+Step 2.2: Verify K3s is running
+---------------------------------
+  sudo systemctl status k3s
+  kubectl get nodes
+  # Expected: NAME   STATUS   ROLES  AGE  VERSION
+
+Step 2.3: Set up kubeconfig
+----------------------------
+  mkdir -p ~/.kube
+  sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+  sudo chown $USER:$USER ~/.kube/config
+  export KUBECONFIG=~/.kube/config
+  echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
+
+Step 2.4: Install Helm
+-----------------------
+  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  helm version  # Verify
+
+
+====================================================
+PHASE 3 — NGINX INGRESS CONTROLLER
+====================================================
+
+Step 3.1: Install NGINX Ingress via Helm
+-----------------------------------------
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+  helm repo update
+  helm install ingress-nginx ingress-nginx/ingress-nginx \
+    --namespace ingress-nginx \
+    --create-namespace \
+    --set controller.service.externalIPs[0]=74.225.253.132
+
+Step 3.2: Verify Ingress
+--------------------------
+  kubectl get pods -n ingress-nginx
+  kubectl get svc -n ingress-nginx
+  # EXTERNAL-IP should show 74.225.253.132
+
+
+====================================================
+PHASE 4 — TLS WITH CERT-MANAGER
+====================================================
+
+Step 4.1: Install cert-manager
+--------------------------------
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+  helm install cert-manager jetstack/cert-manager \
+    --namespace cert-manager \
+    --create-namespace \
+    --set installCRDs=true
+
+Step 4.2: Create ClusterIssuer (Self-Signed for dev)
+------------------------------------------------------
+Save as /home/ubuntu/cluster-issuer.yaml:
+
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata:
+    name: selfsigned-issuer
+  spec:
+    selfSigned: {}
+
+Apply:
+  kubectl apply -f cluster-issuer.yaml
+  kubectl get clusterissuer
+
+
+====================================================
+PHASE 5 — SAMPLE APPLICATIONS
+====================================================
+
+Step 5.1: Node.js App (user1 & user3)
+---------------------------------------
+Create directory: mkdir -p ~/apps/nodejs && cd ~/apps/nodejs
+
+File: app.js
+  const express = require('express');
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+  const USER = process.env.USER_NAME || 'unknown';
+  app.get('/', (req, res) => {
+    res.send(`<h1>Hello from ${USER}'s website!</h1><p>Pod: ${process.env.HOSTNAME}</p>`);
+  });
+  app.get('/health', (req, res) => res.json({ status: 'ok', user: USER }));
+  app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+
+File: package.json
+  { "name": "tenant-app", "version": "1.0.0",
+    "main": "app.js",
+    "dependencies": { "express": "^4.18.0" } }
+
+File: Dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+EXPOSE 3000
+CMD ["node", "app.js"]
+
+Build and push (replace YOUR_DOCKERHUB_USER):
+  docker build -t containerrepotest.azurecr.io/tenant-nodejs:latest .
+docker push containerrepotest.azurecr.io/tenant-nodejs:latest
+
+Step 5.2: Python Flask App (user2)
+------------------------------------
+Create directory: mkdir -p ~/apps/flask && cd ~/apps/flask
+
+File: app.py
+  from flask import Flask, jsonify
+  import os
+  app = Flask(__name__)
+  USER = os.environ.get('USER_NAME', 'unknown')
+
+  @app.route('/')
+  def index():
+    return f'<h1>Hello from {USER} Flask site!</h1><p>Pod: {os.environ.get("HOSTNAME")}</p>'
+
+  @app.route('/health')
+  def health():
+    return jsonify({'status': 'ok', 'user': USER})
+
+  if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+
+File: requirements.txt
+  flask==3.0.0
+  gunicorn==21.2.0
+
+File: Dockerfile
+  FROM python:3.11-slim
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN pip install -r requirements.txt
+  COPY . .
+  EXPOSE 5000
+  CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+
+Build and push:
+  docker build -t YOUR_DOCKERHUB_USER/tenant-flask:latest .
+  docker push YOUR_DOCKERHUB_USER/tenant-flask:latest
+
+
+====================================================
+PHASE 6 — KUBERNETES MANIFESTS (3 TENANTS)
+====================================================
+
+Step 6.1: Create Namespaces
+----------------------------
+  kubectl create namespace user1
+  kubectl create namespace user2
+  kubectl create namespace user3
+
+--- MANIFEST: user1 (Node.js) ---
+Save as ~/k8s/user1-deployment.yaml:
+
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: webapp
+    namespace: user1
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: webapp
+    template:
+      metadata:
+        labels:
+          app: webapp
+      spec:
+        containers:
+        - name: webapp
+          image: YOUR_DOCKERHUB_USER/tenant-nodejs:latest
+          ports:
+          - containerPort: 3000
+          env:
+          - name: USER_NAME
+            value: "user1"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+  ---
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: webapp-svc
+    namespace: user1
+  spec:
+    selector:
+      app: webapp
+    ports:
+    - port: 80
+      targetPort: 3000
+  ---
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: webapp-ingress
+    namespace: user1
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: selfsigned-issuer
+  spec:
+    tls:
+    - hosts:
+      - user1.74.225.253.132.nip.io
+      secretName: user1-tls
+    rules:
+    - host: user1.74.225.253.132.nip.io
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: webapp-svc
+              port:
+                number: 80
+
+(Repeat similarly for user2 with flask image/port 5000, and user3 with nodejs image)
+
+Step 6.2: Apply all manifests
+-------------------------------
+  kubectl apply -f ~/k8s/user1-deployment.yaml
+  kubectl apply -f ~/k8s/user2-deployment.yaml
+  kubectl apply -f ~/k8s/user3-deployment.yaml
+
+Step 6.3: Add Network Policies
+--------------------------------
+Save as ~/k8s/network-policy.yaml (apply to each namespace):
+
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: deny-cross-namespace
+    namespace: user1
+  spec:
+    podSelector: {}
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: user1
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: ingress-nginx
+
+  kubectl apply -f ~/k8s/network-policy.yaml
+
+Step 6.4: Add Resource Quotas
+-------------------------------
+  apiVersion: v1
+  kind: ResourceQuota
+  metadata:
+    name: user1-quota
+    namespace: user1
+  spec:
+    hard:
+      requests.cpu: "1"
+      requests.memory: 512Mi
+      limits.cpu: "2"
+      limits.memory: 1Gi
+      pods: "10"
+
+  kubectl apply -f ~/k8s/resource-quota.yaml
+
+Step 6.5: Verify all deployments
+----------------------------------
+  kubectl get all -n user1
+  kubectl get all -n user2
+  kubectl get all -n user3
+  kubectl get ingress -A
+
+Step 6.6: Test access via curl
+--------------------------------
+  curl -k https://user1.74.225.253.132.nip.io
+  curl -k https://user2.74.225.253.132.nip.io
+  curl -k https://user3.74.225.253.132.nip.io
+
+
+====================================================
+PHASE 7 — HPA (AUTO-SCALING)
+====================================================
+
+Step 7.1: Install metrics-server (if not present)
+---------------------------------------------------
+  kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  # Patch for single-node (disable TLS verification):
+  kubectl patch deployment metrics-server -n kube-system \
+    --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+Step 7.2: Create HPA for each namespace
+-----------------------------------------
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: webapp-hpa
+    namespace: user1
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: webapp
+    minReplicas: 2
+    maxReplicas: 10
+    metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+  kubectl apply -f ~/k8s/hpa-user1.yaml
+
+Step 7.3: Add PodDisruptionBudget
+-----------------------------------
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata:
+    name: webapp-pdb
+    namespace: user1
+  spec:
+    minAvailable: 1
+    selector:
+      matchLabels:
+        app: webapp
+
+  kubectl apply -f ~/k8s/pdb-user1.yaml
+
+Step 7.4: Simulate load to trigger scaling
+--------------------------------------------
+  # Install hey (HTTP load tool)
+  sudo apt install -y hey  # or: go install github.com/rakyll/hey@latest
+
+  # Run load test
+  hey -z 2m -c 50 http://user1.74.225.253.132.nip.io/
+
+  # Watch HPA in real-time in another terminal
+  watch kubectl get hpa -n user1
+  watch kubectl get pods -n user1
+
+
+====================================================
+PHASE 8 — KAFKA (SINGLE-NODE VIA DOCKER)
+====================================================
+
+Step 8.1: Start Kafka with Docker Compose
+------------------------------------------
+Save as ~/kafka/docker-compose.yml:
+
+  version: '3'
+  services:
+    zookeeper:
+      image: confluentinc/cp-zookeeper:7.5.0
+      environment:
+        ZOOKEEPER_CLIENT_PORT: 2181
+      ports:
+      - "2181:2181"
+
+    kafka:
+      image: confluentinc/cp-kafka:7.5.0
+      depends_on:
+      - zookeeper
+      ports:
+      - "9092:9092"
+      environment:
+        KAFKA_BROKER_ID: 1
+        KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+        KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://74.225.253.132:9092
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+
+Start:
+  cd ~/kafka && docker compose up -d
+  docker compose ps  # Verify both running
+
+Step 8.2: Create topic and test
+---------------------------------
+  # Create topic
+  docker exec kafka kafka-topics \
+    --create --topic deployment-events \
+    --bootstrap-server localhost:9092 \
+    --partitions 1 --replication-factor 1
+
+  # List topics
+  docker exec kafka kafka-topics \
+    --list --bootstrap-server localhost:9092
+
+  # Start consumer (keep open in another terminal)
+  docker exec -it kafka kafka-console-consumer \
+    --bootstrap-server localhost:9092 \
+    --topic deployment-events --from-beginning
+
+  # Publish test event
+  echo '{"event":"WebsiteCreated","user":"user1","timestamp":"2024-01-01T00:00:00Z"}' | \
+    docker exec -i kafka kafka-console-producer \
+    --bootstrap-server localhost:9092 \
+    --topic deployment-events
+
+Step 8.3: Add Kafka publisher to your app
+------------------------------------------
+Install in Node.js app: npm install kafkajs
+
+Add to app.js:
+  const { Kafka } = require('kafkajs');
+  const kafka = new Kafka({ brokers: ['74.225.253.132:9092'] });
+  const producer = kafka.producer();
+
+  async function publishDeploymentEvent(user) {
+    await producer.connect();
+    await producer.send({
+      topic: 'deployment-events',
+      messages: [{
+        value: JSON.stringify({
+          event: 'WebsiteCreated',
+          user: user,
+          timestamp: new Date().toISOString()
+        })
+      }]
+    });
+    await producer.disconnect();
+  }
+
+
+====================================================
+PHASE 9 — CI/CD PIPELINE (GITHUB ACTIONS)
+====================================================
+
+Step 9.1: Repository structure
+--------------------------------
+  your-repo/
+  ├── .github/workflows/
+  │   ├── deploy-user1.yml
+  │   ├── deploy-user2.yml
+  │   └── deploy-user3.yml
+  ├── apps/
+  │   ├── nodejs/
+  │   └── flask/
+  └── k8s/
+      ├── user1/
+      ├── user2/
+      └── user3/
+
+Step 9.2: GitHub Secrets to configure
+---------------------------------------
+In your GitHub repo → Settings → Secrets:
+  DOCKERHUB_USERNAME    → your Docker Hub username
+  DOCKERHUB_TOKEN       → your Docker Hub access token
+  KUBE_CONFIG           → base64-encoded ~/.kube/config
+                          (run: base64 ~/.kube/config | tr -d '\n')
+  KAFKA_BROKER          → 74.225.253.132:9092
+
+Step 9.3: Pipeline YAML
+-------------------------
+Save as .github/workflows/deploy-user1.yml:
+
+  name: Deploy user1
+
+  on:
+    push:
+      branches: [main]
+      paths: ['apps/nodejs/**']
+    workflow_dispatch:
+
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      outputs:
+        image_tag: ${{ steps.meta.outputs.version }}
+      steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/tenant-nodejs
+          tags: |
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/nodejs
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+    deploy:
+      needs: build
+      runs-on: ubuntu-latest
+      steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Deploy to user1 namespace
+        id: deploy
+        run: |
+          kubectl set image deployment/webapp \
+            webapp=${{ secrets.DOCKERHUB_USERNAME }}/tenant-nodejs:${{ needs.build.outputs.image_tag }} \
+            -n user1
+          kubectl rollout status deployment/webapp -n user1 --timeout=120s
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "Deployment failed — rolling back"
+          kubectl rollout undo deployment/webapp -n user1
+          kubectl rollout status deployment/webapp -n user1
+
+      - name: Publish Kafka deployment event
+        if: success()
+        run: |
+          docker run --rm confluentinc/cp-kafka:7.5.0 \
+            kafka-console-producer \
+            --bootstrap-server ${{ secrets.KAFKA_BROKER }} \
+            --topic deployment-events <<< \
+            '{"event":"WebsiteDeployed","user":"user1","image":"${{ needs.build.outputs.image_tag }}","status":"success","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
+
+
+====================================================
+PHASE 10 — OBSERVABILITY (PROMETHEUS + GRAFANA)
+====================================================
+
+Step 10.1: Install Prometheus + Grafana stack
+-----------------------------------------------
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  helm repo update
+  helm install monitoring prometheus-community/kube-prometheus-stack \
+    --namespace monitoring \
+    --create-namespace \
+    --set grafana.service.type=NodePort \
+    --set grafana.service.nodePort=32000 \
+    --set prometheus.service.type=NodePort \
+    --set prometheus.service.nodePort=32001
+
+Step 10.2: Access Grafana
+--------------------------
+  URL:      http://74.225.253.132:32000
+  Username: admin
+  Password: prom-operator (default)
+
+  # Or get password:
+  kubectl get secret -n monitoring monitoring-grafana \
+    -o jsonpath="{.data.admin-password}" | base64 -d
+
+Step 10.3: Key Grafana dashboards to import
+--------------------------------------------
+  Dashboard ID 6417  → Kubernetes Cluster Overview
+  Dashboard ID 8685  → Kubernetes Deployment Metrics
+  Dashboard ID 11074 → Node Exporter (VM metrics)
+
+  In Grafana: + → Import → Enter dashboard ID → Load
+
+Step 10.4: Verify metrics scraping
+------------------------------------
+  kubectl get servicemonitor -n monitoring
+  kubectl get pods -n monitoring
+
+
+====================================================
+PHASE 11 — DYNAMIC DOMAIN MAPPING (EXPLANATION)
+====================================================
+
+How it works:
+-----------
+nip.io provides wildcard DNS resolution using the IP embedded in the hostname.
+Any subdomain like <label>.<ip>.nip.io resolves to <ip>.
+
+Adding a new user (e.g., user4) requires NO cluster redeployment:
+
+1. Create namespace:   kubectl create namespace user4
+2. Deploy app:         kubectl apply -f ~/k8s/user4-deployment.yaml
+3. Apply Ingress with host: user4.74.225.253.132.nip.io
+4. Access immediately at: https://user4.74.225.253.132.nip.io
+
+The Ingress controller reads the Host header and routes to the correct
+service without any DNS zone changes or cluster restarts.
+
+
+====================================================
+DELIVERABLES CHECKLIST
+====================================================
+
+□ 1. kubectl get all -n user1 / user2 / user3
+     Command: kubectl get all -n user1
+              kubectl get all -n user2
+              kubectl get all -n user3
+
+□ 2. Proof of access via curl
+     Command: curl -k https://user1.74.225.253.132.nip.io
+              curl -k https://user2.74.225.253.132.nip.io
+              curl -k https://user3.74.225.253.132.nip.io
+
+□ 3. HPA scaling proof
+     Command: kubectl get hpa -A
+              kubectl describe hpa webapp-hpa -n user1
+
+□ 4. Kafka events proof
+     Run consumer, then trigger deployment → see event appear
+
+□ 5. CI/CD logs
+     GitHub Actions → workflow run → show green deploy + rollback test
+
+□ 6. Grafana dashboard screenshots
+     http://74.225.253.132:32000 → Kubernetes dashboards
+
+
+====================================================
+QUICK REFERENCE — ALL IMPORTANT URLS
+====================================================
+
+  user1 site:    https://user1.74.225.253.132.nip.io
+  user2 site:    https://user2.74.225.253.132.nip.io
+  user3 site:    https://user3.74.225.253.132.nip.io
+  Grafana:       http://74.225.253.132:32000
+  Prometheus:    http://74.225.253.132:32001
+  Kafka broker:  74.225.253.132:9092
+  K8s API:       https://74.225.253.132:6443
+
+====================================================
+END OF GUIDE
+====================================================

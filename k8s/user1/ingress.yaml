@@ -1,0 +1,24 @@
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: webapp-ingress
+    namespace: user1
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: selfsigned-issuer
+  spec:
+    tls:
+    - hosts:
+      - user1.74.225.253.132.nip.io
+      secretName: user1-tls
+    rules:
+    - host: user1.74.225.253.132.nip.io
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: webapp-svc
+              port:
+                number: 80
