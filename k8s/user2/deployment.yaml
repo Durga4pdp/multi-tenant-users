@@ -13,6 +13,8 @@
         labels:
           app: webapp
       spec:
+        imagePullSecrets:
+        - name: acr-secret
         containers:
         - name: webapp
           image: containerrepotest.azurecr.io/tenant-flask:latest

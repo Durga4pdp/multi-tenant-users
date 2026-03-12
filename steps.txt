@@ -125,7 +125,13 @@ Apply:
   kubectl apply -f cluster-issuer.yaml
   kubectl get clusterissuer
 
-
+================================================
+kubectl create secret docker-registry acr-secret \
+  --docker-server=containerrepotest.azurecr.io \
+  --docker-username=<ACR_USERNAME> \
+  --docker-password=<ACR_PASSWORD> \
+  --namespace=user1
+============================
 ====================================================
 PHASE 5 — SAMPLE APPLICATIONS
 ====================================================
