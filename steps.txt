@@ -2,7 +2,6 @@
   DEVOPS SETUP GUIDE — MULTI-TENANT HOSTING PLATFORM
   VM Public IP: 74.225.253.132 | Ubuntu 24.04
 ====================================================
-
 DNS STRATEGY: nip.io (No Domain Purchase Needed)
 -------------------------------------------------
 nip.io is a free wildcard DNS service. Any subdomain ending in
